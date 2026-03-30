@@ -30,6 +30,7 @@ type Config struct {
 	SockBuf      int    `json:"sockbuf"`
 	SmuxVer      int    `json:"smuxver"`
 	SmuxBuf      int    `json:"smuxbuf"`
+	FrameSize    int    `json:"framesize"`
 	StreamBuf    int    `json:"streambuf"`
 	KeepAlive    int    `json:"keepalive"`
 	Log          string `json:"log"`
@@ -38,6 +39,7 @@ type Config struct {
 	Quiet        bool   `json:"quiet"`
 	TCP          bool   `json:"tcp"`
 	Vpn          bool   `json:"vpn"`
+	CloseWait    int    `json:"closewait"`
 }
 
 func parseJSONConfig(config *Config, path string) error {

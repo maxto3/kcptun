@@ -13,9 +13,11 @@ type MultiPort struct {
 	MaxPort uint64
 }
 
-// Parse mulitport listener or dialer
+// remoteAddrMatcher is pre-compiled to avoid regex compilation overhead on each call.
+var remoteAddrMatcher = regexp.MustCompile(`(.*)\:([0-9]{1,5})-?([0-9]{1,5})?`)
+
+// ParseMultiPort parses a multiport listener or dialer address.
 func ParseMultiPort(addr string) (*MultiPort, error) {
-	remoteAddrMatcher := regexp.MustCompile(`(.*)\:([0-9]{1,5})-?([0-9]{1,5})?`)
 	matches := remoteAddrMatcher.FindStringSubmatch(addr)
 
 	if len(matches) >= 4 {

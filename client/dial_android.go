@@ -70,9 +70,9 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"net"
 	"syscall"
-	"log"
 
 	"github.com/pkg/errors"
 	kcp "github.com/xtaci/kcp-go/v5"
@@ -133,18 +133,24 @@ type connectedUDPConn struct{ *net.UDPConn }
 func (c *connectedUDPConn) WriteTo(b []byte, addr net.Addr) (int, error) { return c.Write(b) }
 
 func dial(config *Config, block kcp.BlockCrypt) (*kcp.UDPSession, error) {
-	mp, err := generic.ParseMultiPort(config.RemoteAddr)
-	if err != nil {
-		return nil, err
+	// Parse the multiPort definition only once.
+	multiPortOnce.Do(func() {
+		multiPort, multiPortParseError = generic.ParseMultiPort(config.RemoteAddr)
+	})
+
+	// Abort when the multiPort definition is invalid.
+	if multiPortParseError != nil {
+		return nil, multiPortParseError
 	}
 
+	// Pick a random destination port within the configured range.
 	var randport uint64
-	err = binary.Read(rand.Reader, binary.LittleEndian, &randport)
+	err := binary.Read(rand.Reader, binary.LittleEndian, &randport)
 	if err != nil {
 		return nil, err
 	}
 
-	remoteAddr := fmt.Sprintf("%v:%v", mp.Host, uint64(mp.MinPort)+randport%uint64(mp.MaxPort-mp.MinPort+1))
+	remoteAddr := fmt.Sprintf("%v:%v", multiPort.Host, uint64(multiPort.MinPort)+randport%uint64(multiPort.MaxPort-multiPort.MinPort+1))
 	if !VpnMode {
 		if config.TCP {
 			conn, err := tcpraw.Dial("tcp", remoteAddr)

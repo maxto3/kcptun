@@ -34,40 +34,38 @@ var VpnMode = false
 // VERSION is injected by buildflags
 var VERSION = "SELFBUILD"
 
-// handleClient aggregates connection p1 on mux with 'writeLock'
-func handleClient(session *smux.Session, p1 net.Conn, quiet bool) {
-	logln := func(v ...interface{}) {
-		// if !quiet {
-		// 	log.Println(v...)
-		// }
-		return
+// handleClient tunnels a single accepted TCP/UNIX client through an smux
+// stream and optionally wraps the stream in QPP for additional obfuscation.
+func handleClient(session *smux.Session, p1 net.Conn, quiet bool, closeWait int) {
+	logln := func(v ...any) {
+		if !quiet {
+			log.Println(v...)
+		}
 	}
+
+	// Transport layer: accept the inbound socket and clean it up on exit.
 	defer p1.Close()
 	p2, err := session.OpenStream()
 	if err != nil {
 		logln(err)
 		return
 	}
-
 	defer p2.Close()
 
-	logln("stream opened", "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
-	defer logln("stream closed", "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
+	streamID := fmt.Sprintf("%v(%d)", p2.RemoteAddr(), p2.ID())
+	logln("stream opened", "in:", p1.RemoteAddr(), "out:", streamID)
+	defer logln("stream closed", "in:", p1.RemoteAddr(), "out:", streamID)
 
-	// start tunnel & wait for tunnel termination
-	streamCopy := func(dst io.Writer, src io.ReadCloser) {
-		if _, err := generic.Copy(dst, src); err != nil {
-			// report protocol error
-			if err == smux.ErrInvalidProtocol {
-				log.Println("smux", err, "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
-			}
-		}
-		p1.Close()
-		p2.Close()
+	// Begin piping data bidirectionally between the socket and the smux stream.
+	err1, err2 := generic.Pipe(p1, p2, closeWait)
+
+	// Report non-EOF errors so operators can diagnose failing streams.
+	if err1 != nil && !errors.Is(err1, io.EOF) {
+		logln("pipe:", err1, "in:", p1.RemoteAddr(), "out:", streamID)
 	}
-
-	go streamCopy(p1, p2)
-	streamCopy(p2, p1)
+	if err2 != nil && !errors.Is(err2, io.EOF) {
+		logln("pipe:", err2, "in:", p1.RemoteAddr(), "out:", streamID)
+	}
 }
 
 func checkError(err error) {
@@ -105,10 +103,10 @@ func main() {
 			Usage: "kcp server address",
 		},
 		&cli.StringFlag{
-			Name:    "key",
-			Value:   "it's a secrect",
-			Usage:   "pre-shared secret between client and server",
-			EnvVars: []string{"KCPTUN_KEY"},
+			Name:   "key",
+			Value:  "it's a secrect",
+			Usage:  "pre-shared secret between client and server",
+			EnvVar: "KCPTUN_KEY",
 		},
 		&cli.StringFlag{
 			Name:  "crypt",
@@ -210,6 +208,11 @@ func main() {
 			Usage: "the overall de-mux buffer in bytes",
 		},
 		&cli.IntFlag{
+			Name:  "framesize",
+			Value: 32768,
+			Usage: "set the maximum frame size in bytes",
+		},
+		&cli.IntFlag{
 			Name:  "streambuf",
 			Value: 2097152,
 			Usage: "per stream receive buffer in bytes, smux v2+",
@@ -251,6 +254,11 @@ func main() {
 			Name:  "V",
 			Usage: "Enable VPN mode for shadowsocks-android",
 		},
+		&cli.IntFlag{
+			Name:  "closewait",
+			Value: 0,
+			Usage: "set how long to wait (in seconds) before closing the connection",
+		},
 	}
 	myApp.Action = func(c *cli.Context) error {
 		config := Config{}
@@ -277,6 +285,7 @@ func main() {
 		config.NoCongestion = c.Int("nc")
 		config.SockBuf = c.Int("sockbuf")
 		config.SmuxBuf = c.Int("smuxbuf")
+		config.FrameSize = c.Int("framesize")
 		config.StreamBuf = c.Int("streambuf")
 		config.SmuxVer = c.Int("smuxver")
 		config.KeepAlive = c.Int("keepalive")
@@ -286,6 +295,7 @@ func main() {
 		config.Quiet = c.Bool("quiet")
 		config.TCP = c.Bool("tcp")
 		config.Vpn = c.Bool("V")
+		config.CloseWait = c.Int("closewait")
 
 		if c.String("c") != "" {
 			err := parseJSONConfig(&config, c.String("c"))
@@ -396,6 +406,16 @@ func main() {
 			if c, b := opts.Get("sockbuf"); b {
 				if sockbuf, err := strconv.Atoi(c); err == nil {
 					config.SockBuf = sockbuf
+				}
+			}
+			if c, b := opts.Get("closewait"); b {
+				if closewait, err := strconv.Atoi(c); err == nil {
+					config.CloseWait = closewait
+				}
+			}
+			if c, b := opts.Get("framesize"); b {
+				if framesize, err := strconv.Atoi(c); err == nil {
+					config.FrameSize = framesize
 				}
 			}
 			if c, b := opts.Get("smuxbuf"); b {
@@ -561,14 +581,16 @@ func main() {
 				log.Println("SetWriteBuffer:", err)
 			}
 			log.Println("smux version:", config.SmuxVer, "on connection:", kcpconn.LocalAddr(), "->", kcpconn.RemoteAddr())
-			smuxConfig := smux.DefaultConfig()
-			smuxConfig.Version = config.SmuxVer
-			smuxConfig.MaxReceiveBuffer = config.SmuxBuf
-			smuxConfig.MaxStreamBuffer = config.StreamBuf
-			smuxConfig.KeepAliveInterval = time.Duration(config.KeepAlive) * time.Second
-
-			if err := smux.VerifyConfig(smuxConfig); err != nil {
-				log.Fatalf("%+v", err)
+			smuxConfig, err := generic.BuildSmuxConfig(
+				config.SmuxVer,
+				config.SmuxBuf,
+				config.StreamBuf,
+				config.FrameSize,
+				config.KeepAlive,
+			)
+			if err != nil {
+				kcpconn.Close()
+				return nil, errors.Wrap(err, "BuildSmuxConfig()")
 			}
 
 			// stream multiplex
@@ -626,7 +648,7 @@ func main() {
 				}
 			}
 
-			go handleClient(muxes[idx].session, p1, config.Quiet)
+			go handleClient(muxes[idx].session, p1, config.Quiet, config.CloseWait)
 			rr++
 		}
 	}
