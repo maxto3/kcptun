@@ -60,11 +60,20 @@ func handleClient(session *smux.Session, p1 net.Conn, quiet bool, closeWait int)
 	err1, err2 := generic.Pipe(p1, p2, closeWait)
 
 	// Report non-EOF errors so operators can diagnose failing streams.
+	// If VpnMode is enabled, any fatal error on either side of the pipe should trigger a session closure.
 	if err1 != nil && !errors.Is(err1, io.EOF) {
-		logln("pipe:", err1, "in:", p1.RemoteAddr(), "out:", streamID)
+		logln("pipe (in):", err1, "in:", p1.RemoteAddr(), "out:", streamID)
+		if VpnMode {
+			logln("fatal error on client pipe, closing session for reconnection")
+			session.Close()
+		}
 	}
 	if err2 != nil && !errors.Is(err2, io.EOF) {
-		logln("pipe:", err2, "in:", p1.RemoteAddr(), "out:", streamID)
+		logln("pipe (out):", err2, "in:", p1.RemoteAddr(), "out:", streamID)
+		if VpnMode {
+			logln("fatal error on smux stream, closing session for reconnection")
+			session.Close()
+		}
 	}
 }
 
@@ -312,7 +321,6 @@ func main() {
 
 		opts, err := parseEnv()
 		if err == nil {
-			fmt.Printf("test")
 			if c, b := opts.Get("localaddr"); b {
 				config.LocalAddr = c
 			}
@@ -630,6 +638,27 @@ func main() {
 		// start listener
 		numconn := uint16(config.Conn)
 		muxes := make([]timedSession, numconn)
+
+		// health check for smux sessions in VpnMode
+		if config.Vpn {
+			go func() {
+				ticker := time.NewTicker(time.Duration(config.KeepAlive) * time.Second)
+				defer ticker.Stop()
+				for range ticker.C {
+					for i := range muxes {
+						s := muxes[i].session
+						if s != nil && !s.IsClosed() {
+							// In VpnMode, we want to be aggressive about refreshing connections.
+							// Proactively close idle sessions to ensure fresh connections on next demand.
+							if s.NumStreams() == 0 {
+								s.Close()
+							}
+						}
+					}
+				}
+			}()
+		}
+
 		rr := uint16(0)
 		for {
 			p1, err := listener.Accept()
@@ -697,13 +726,10 @@ func parentMonitor(interval int) {
 	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
 	pid := os.Getppid()
-	for {
-		select {
-		case <-ticker.C:
-			curpid := os.Getppid()
-			if curpid != pid {
-				os.Exit(1)
-			}
+	for range ticker.C {
+		curpid := os.Getppid()
+		if curpid != pid {
+			os.Exit(1)
 		}
 	}
 }
